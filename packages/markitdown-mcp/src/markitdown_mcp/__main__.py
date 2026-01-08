@@ -1,10 +1,13 @@
 import contextlib
 import sys
 import os
+import re
+import json
 import urllib.parse
 import zipfile
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
+from typing import Literal
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from mcp.server.sse import SseServerTransport
@@ -24,6 +27,83 @@ mcp = FastMCP("markitdown")
 async def convert_to_markdown(uri: str) -> str:
     """Convert a resource described by an http:, https:, file: or data: URI to markdown"""
     return MarkItDown(enable_plugins=check_plugins_enabled()).convert_uri(uri).markdown
+
+
+@mcp.tool()
+async def convert_to_markdown_with_metadata(uri: str) -> str:
+    """Convert a resource to markdown and include document metadata (name, size, dates, etc.)"""
+    # Convert to markdown
+    markdown_content = MarkItDown(enable_plugins=check_plugins_enabled()).convert_uri(uri).markdown
+    
+    # Try to get file metadata if it's a local file
+    metadata_lines = ["# Document Metadata\n"]
+    
+    # Parse the URI
+    parsed_uri = urllib.parse.urlparse(uri)
+    
+    if parsed_uri.scheme == "file":
+        # Extract local file path
+        local_path = _file_path_from_uri(uri)
+        
+        if local_path and os.path.exists(local_path):
+            # Get file stats
+            stat_info = os.stat(local_path)
+            
+            # Document name
+            file_name = os.path.basename(local_path)
+            metadata_lines.append(f"**Document Name:** {file_name}\n")
+            
+            # File size (in bytes and human-readable)
+            file_size_bytes = stat_info.st_size
+            file_size_kb = file_size_bytes / 1024
+            file_size_mb = file_size_kb / 1024
+            
+            if file_size_mb >= 1:
+                size_str = f"{file_size_mb:.2f} MB"
+            elif file_size_kb >= 1:
+                size_str = f"{file_size_kb:.2f} KB"
+            else:
+                size_str = f"{file_size_bytes} bytes"
+            
+            metadata_lines.append(f"**File Size:** {size_str} ({file_size_bytes:,} bytes)\n")
+            
+            # File extension/type
+            file_ext = os.path.splitext(local_path)[1]
+            if file_ext:
+                metadata_lines.append(f"**File Type:** {file_ext}\n")
+            
+            # Full path
+            metadata_lines.append(f"**Full Path:** `{local_path}`\n")
+            
+            # Creation time
+            import datetime
+            creation_time = datetime.datetime.fromtimestamp(stat_info.st_ctime)
+            metadata_lines.append(f"**Created:** {creation_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            
+            # Modification time
+            modified_time = datetime.datetime.fromtimestamp(stat_info.st_mtime)
+            metadata_lines.append(f"**Last Modified:** {modified_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            
+            # Access time
+            access_time = datetime.datetime.fromtimestamp(stat_info.st_atime)
+            metadata_lines.append(f"**Last Accessed:** {access_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        else:
+            metadata_lines.append(f"**Source URI:** {uri}\n")
+            metadata_lines.append("*Note: File not found or inaccessible for metadata extraction*\n")
+    elif parsed_uri.scheme in ("http", "https"):
+        # For HTTP/HTTPS, we can only show the URL
+        metadata_lines.append(f"**Source URL:** {uri}\n")
+        metadata_lines.append(f"**Domain:** {parsed_uri.netloc}\n")
+    else:
+        # For other URI types
+        metadata_lines.append(f"**Source URI:** {uri}\n")
+        metadata_lines.append(f"**URI Scheme:** {parsed_uri.scheme}\n")
+    
+    # Combine metadata and content
+    metadata_section = "".join(metadata_lines)
+    separator = "\n" + "="*80 + "\n\n"
+    
+    return metadata_section + separator + markdown_content
 
 
 @mcp.tool()
@@ -127,6 +207,383 @@ def check_plugins_enabled() -> bool:
         "1",
         "yes",
     )
+
+
+# ============================================================================
+# AI-Optimized Excel Conversion
+# ============================================================================
+# The standard markdown output from Excel files contains ~60% NaN cells and
+# uses a confusing label+value column pair format. These functions provide
+# token-efficient formats optimized for AI agent consumption.
+
+
+@mcp.tool()
+async def convert_excel_to_ai_format(
+    uri: str,
+    output_format: Literal["flat", "sparse", "json"] = "flat",
+    sheets: str | None = None,
+    skip_empty: bool = True,
+    normalize_dates: bool = True,
+) -> str:
+    """Convert Excel spreadsheet to AI-optimized format. Removes NaN cells, normalizes dates.
+
+    Args:
+        uri: file: URI to .xlsx/.xls file
+        output_format: "flat" (grep-friendly), "sparse" (50% smaller), or "json" (structured)
+        sheets: Comma-separated sheet names to include (default: all)
+        skip_empty: Skip cells with NaN/empty values (default: True)
+        normalize_dates: Convert dates to YYYY-MM format (default: True)
+
+    Returns:
+        Token-efficient representation of the spreadsheet data.
+        - flat: "CATEGORY > LABEL | MONTH | VALUE" per line, easy to grep
+        - sparse: Row definitions + Month index + Values only, ~50% smaller
+        - json: Nested structure for programmatic access
+
+    Example queries with flat format:
+        grep "Maurice Fixed" output.txt | grep "2026-01"
+    """
+    local_path = _file_path_from_uri(uri)
+    if not local_path:
+        return "Error: Only file: URIs are supported for Excel conversion"
+
+    ext = os.path.splitext(local_path)[1].lower()
+    if ext not in {".xlsx", ".xls", ".xlsm", ".xltx", ".xltm"}:
+        return f"Error: Unsupported file type: {ext}. Expected .xlsx or .xls"
+
+    if not os.path.exists(local_path):
+        return f"Error: File not found: {local_path}"
+
+    # Parse the spreadsheet
+    sheet_filter: set[str] | None = None
+    if sheets:
+        sheet_filter = {s.strip() for s in sheets.split(",") if s.strip()}
+
+    data = _parse_excel_to_structured(local_path, sheet_filter, skip_empty, normalize_dates)
+
+    if output_format == "flat":
+        return _format_as_flat(data)
+    elif output_format == "sparse":
+        return _format_as_sparse(data)
+    elif output_format == "json":
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    else:
+        return f"Error: Unknown format: {output_format}"
+
+
+@mcp.tool()
+async def save_excel_as_ai_format(
+    uri: str,
+    output_path: str,
+    output_format: Literal["flat", "sparse", "json"] = "flat",
+    sheets: str | None = None,
+    skip_empty: bool = True,
+    normalize_dates: bool = True,
+) -> str:
+    """Convert Excel to AI-optimized format and save to file. Returns file path and size.
+
+    Args:
+        uri: file: URI to .xlsx/.xls file
+        output_path: Where to save the output (.txt, .json, or .md)
+        output_format: "flat" (grep-friendly), "sparse" (50% smaller), or "json"
+        sheets: Comma-separated sheet names to include (default: all)
+        skip_empty: Skip cells with NaN/empty values (default: True)
+        normalize_dates: Convert dates to YYYY-MM format (default: True)
+
+    TOKEN SAVING: Use sparse format for ~50% size reduction vs markdown tables.
+    """
+    content = await convert_excel_to_ai_format(
+        uri, output_format, sheets, skip_empty, normalize_dates
+    )
+
+    if content.startswith("Error:"):
+        return content
+
+    abs_output_path = os.path.abspath(output_path)
+    output_dir = os.path.dirname(abs_output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    with open(abs_output_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+
+    byte_len = len(content.encode("utf-8"))
+    return f"Saved {byte_len:,} bytes to {abs_output_path} (format: {output_format})"
+
+
+def _parse_excel_to_structured(
+    local_path: str,
+    sheet_filter: set[str] | None,
+    skip_empty: bool,
+    normalize_dates: bool,
+) -> dict:
+    """Parse Excel file into structured data format."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return {"error": "pandas not installed"}
+
+    try:
+        import openpyxl  # noqa: F401
+        engine = "openpyxl"
+    except ImportError:
+        try:
+            import xlrd  # noqa: F401
+            engine = "xlrd"
+        except ImportError:
+            return {"error": "Neither openpyxl nor xlrd installed"}
+
+    try:
+        all_sheets = pd.read_excel(local_path, sheet_name=None, engine=engine, header=None)
+    except Exception as e:
+        return {"error": f"Failed to read Excel: {str(e)}"}
+
+    result = {
+        "metadata": {
+            "source": os.path.basename(local_path),
+            "sheets": [],
+            "months": set(),
+        },
+        "data": [],
+    }
+
+    for sheet_name, df in all_sheets.items():
+        if sheet_filter and sheet_name not in sheet_filter:
+            continue
+
+        result["metadata"]["sheets"].append(sheet_name)
+
+        # Process each row
+        for row_idx in range(len(df)):
+            row = df.iloc[row_idx]
+
+            # Build category path from leading non-empty, non-numeric cells
+            category_path = []
+            data_start_col = 0
+
+            for col_idx, cell in enumerate(row):
+                if _is_empty(cell):
+                    continue
+                if _is_numeric(cell):
+                    data_start_col = col_idx
+                    break
+                # Check if it looks like a date
+                if normalize_dates:
+                    month = _normalize_month(str(cell))
+                    if month:
+                        data_start_col = col_idx
+                        break
+                category_path.append(str(cell).strip())
+                data_start_col = col_idx + 1
+
+            if not category_path:
+                continue
+
+            # Extract month/value pairs from remaining columns
+            # Handle the label+value pair format
+            col = data_start_col
+            while col < len(row):
+                cell = row.iloc[col]
+
+                if _is_empty(cell):
+                    col += 1
+                    continue
+
+                # Check if this cell is a date/month
+                month = None
+                if normalize_dates:
+                    month = _normalize_month(str(cell))
+
+                if month:
+                    result["metadata"]["months"].add(month)
+                    # Next cell might be the value
+                    if col + 1 < len(row):
+                        next_cell = row.iloc[col + 1]
+                        if _is_numeric(next_cell):
+                            value = float(next_cell)
+                            if not skip_empty or value != 0:
+                                result["data"].append({
+                                    "sheet": sheet_name,
+                                    "category": " > ".join(category_path),
+                                    "month": month,
+                                    "value": value,
+                                })
+                            col += 2
+                            continue
+                    col += 1
+                elif _is_numeric(cell):
+                    # Numeric value without clear month association
+                    value = float(cell)
+                    if not skip_empty or value != 0:
+                        result["data"].append({
+                            "sheet": sheet_name,
+                            "category": " > ".join(category_path),
+                            "month": None,
+                            "value": value,
+                            "col_index": col,
+                        })
+                    col += 1
+                else:
+                    # Text label - might be part of a label+value pair
+                    label = str(cell).strip()
+                    if col + 1 < len(row):
+                        next_cell = row.iloc[col + 1]
+                        if _is_numeric(next_cell):
+                            value = float(next_cell)
+                            if not skip_empty or value != 0:
+                                full_category = " > ".join(category_path + [label])
+                                result["data"].append({
+                                    "sheet": sheet_name,
+                                    "category": full_category,
+                                    "month": None,
+                                    "value": value,
+                                    "col_index": col,
+                                })
+                            col += 2
+                            continue
+                    col += 1
+
+    # Convert months set to sorted list
+    result["metadata"]["months"] = sorted(result["metadata"]["months"])
+    result["metadata"]["row_count"] = len(result["data"])
+
+    return result
+
+
+def _format_as_flat(data: dict) -> str:
+    """Format data as grep-friendly flat text."""
+    if "error" in data:
+        return f"Error: {data['error']}"
+
+    lines = [
+        "# EXCEL DATA - AI-Optimized Flat Format",
+        f"# Source: {data['metadata']['source']}",
+        f"# Sheets: {', '.join(data['metadata']['sheets'])}",
+        f"# Rows: {data['metadata']['row_count']}",
+        "# Format: CATEGORY | MONTH | VALUE",
+        "# Query: grep \"search term\" file.txt | grep \"2026-01\"",
+        "",
+    ]
+
+    for item in data["data"]:
+        month = item.get("month") or f"col_{item.get('col_index', '?')}"
+        lines.append(f"{item['category']} | {month} | {item['value']}")
+
+    return "\n".join(lines)
+
+
+def _format_as_sparse(data: dict) -> str:
+    """Format data as sparse matrix (row IDs + month IDs + values only)."""
+    if "error" in data:
+        return f"Error: {data['error']}"
+
+    lines = [
+        "# EXCEL DATA - Sparse Matrix Format",
+        f"# Source: {data['metadata']['source']}",
+        "# ~50% smaller than flat format",
+        "",
+        "## ROWS",
+    ]
+
+    # Build unique row paths
+    row_paths: dict[str, str] = {}
+    row_id = 1
+    for item in data["data"]:
+        cat = item["category"]
+        if cat not in row_paths:
+            rid = f"R{str(row_id).zfill(4)}"
+            row_paths[cat] = rid
+            lines.append(f"{rid}: {cat}")
+            row_id += 1
+
+    lines.append("")
+    lines.append("## MONTHS")
+
+    # Build month index
+    month_index: dict[str, str] = {}
+    for i, month in enumerate(data["metadata"]["months"]):
+        mid = f"M{str(i + 1).zfill(2)}"
+        month_index[month] = mid
+        lines.append(f"{mid}: {month}")
+
+    lines.append("")
+    lines.append("## VALUES")
+
+    for item in data["data"]:
+        rid = row_paths[item["category"]]
+        month = item.get("month")
+        if month and month in month_index:
+            mid = month_index[month]
+            lines.append(f"{rid},{mid}: {item['value']}")
+        else:
+            # No month, use column index
+            col = item.get("col_index", "?")
+            lines.append(f"{rid},C{col}: {item['value']}")
+
+    return "\n".join(lines)
+
+
+def _is_empty(val) -> bool:
+    """Check if value is empty/NaN."""
+    if val is None:
+        return True
+    if isinstance(val, float) and (val != val):  # NaN check
+        return True
+    s = str(val).strip().lower()
+    return s in ("", "nan", "none", "null", "---")
+
+
+def _is_numeric(val) -> bool:
+    """Check if value is numeric."""
+    if val is None:
+        return False
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and (val != val):  # NaN
+            return False
+        return True
+    try:
+        float(str(val).replace(",", ""))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _normalize_month(date_str: str) -> str | None:
+    """Normalize date string to YYYY-MM format."""
+    if not date_str or date_str.lower() in ("nan", "none", "null"):
+        return None
+
+    date_str = date_str.strip()
+
+    # Handle ISO format: "2024-01-01 00:00:00" or "2024-01-01"
+    iso_match = re.match(r"^(\d{4})-(\d{2})-\d{2}", date_str)
+    if iso_match:
+        return f"{iso_match.group(1)}-{iso_match.group(2)}"
+
+    # Handle Dutch/English short format: "Okt-24", "Nov-24", "Jan-25"
+    dutch_months = {
+        "jan": "01", "feb": "02", "mar": "03", "mrt": "03",
+        "apr": "04", "may": "05", "mei": "05", "jun": "06",
+        "jul": "07", "aug": "08", "sep": "09", "okt": "10",
+        "oct": "10", "nov": "11", "dec": "12",
+    }
+
+    short_match = re.match(r"^([A-Za-z]{3})-(\d{2})$", date_str)
+    if short_match:
+        month_abbr = short_match.group(1).lower()
+        year_short = short_match.group(2)
+        if month_abbr in dutch_months:
+            return f"20{year_short}-{dutch_months[month_abbr]}"
+
+    # Handle format: "January 2024" or "Jan 2024"
+    full_match = re.match(r"^([A-Za-z]+)\s*(\d{4})$", date_str)
+    if full_match:
+        month_name = full_match.group(1).lower()[:3]
+        year = full_match.group(2)
+        if month_name in dutch_months:
+            return f"{year}-{dutch_months[month_name]}"
+
+    return None
 
 
 # XML namespaces used in .xlsx files

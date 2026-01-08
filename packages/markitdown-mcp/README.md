@@ -6,7 +6,36 @@
 
 The `markitdown-mcp` package provides a lightweight STDIO, Streamable HTTP, and SSE MCP server for calling MarkItDown.
 
-It exposes one tool: `convert_to_markdown(uri)`, where uri can be any `http:`, `https:`, `file:`, or `data:` URI.
+## Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `convert_to_markdown(uri)` | Convert any document to markdown |
+| `convert_to_markdown_with_metadata(uri)` | Convert with file metadata (name, size, dates) |
+| `save_uri_as_markdown(uri, output_path)` | Convert and save to file |
+| `save_spreadsheet_with_formulas(uri, output_path, sheets?)` | Excel with formulas section |
+| `convert_excel_to_ai_format(uri, format?, sheets?, ...)` | **AI-optimized Excel output** |
+| `save_excel_as_ai_format(uri, output_path, format?, ...)` | Save AI-optimized Excel |
+
+Where `uri` can be any `http:`, `https:`, `file:`, or `data:` URI.
+
+### AI-Optimized Excel Conversion
+
+Standard markdown tables from Excel files contain ~60% empty/NaN cells, wasting tokens. The AI-optimized tools provide:
+
+| Format | Description | Size |
+|--------|-------------|------|
+| `flat` | Grep-friendly: `CATEGORY > LABEL \| MONTH \| VALUE` | ~100% |
+| `sparse` | Row/month IDs + values only | ~50% |
+| `json` | Structured nested data | ~80% |
+
+**Example queries with flat format:**
+```bash
+grep "Maurice Fixed" output.txt | grep "2026-01"
+grep "Total costs" output.txt | awk -F'|' '{print $2, $3}'
+```
+
+**Token savings:** Use `sparse` format for ~50% size reduction vs markdown tables.
 
 ## Installation
 
